@@ -1,0 +1,47 @@
+import 'fake-indexeddb/auto';
+import {readFileSync} from 'node:fs';
+import {afterEach,beforeEach,describe,expect,it} from 'vitest';
+import {aggregate,consumption,costFor,D,makeSale,money,saleResult,validateDraft} from '../src/domain/calculations';
+import {validateSeed} from '../src/domain/seed';
+import {CafeDB,deleteSales,initialize,readAll,saveSale} from '../src/storage/db';
+import type {Dataset,Draft,Sale} from '../src/domain/types';
+const raw=JSON.parse(readFileSync('data/매장운영데이터.json','utf8'));
+const original=validateSeed(raw);
+const draft:Draft={date:'2026-10-12',menu_id:'M02',channel:'포장',quantity:'10',unit_price:'4800',discount_amount:'3000',payment_fee:'675'};
+const example:Sale={sale_id:'example',date:'2026-10-12',menu_id:'M02',channel:'포장',quantity:10,unit_price:'4800',discount_amount:'3000',net_sales:'45000',payment_fee:'675',recipe_version:'R1',unit_food_cost_snapshot:'600',unit_packaging_cost_snapshot:'160'};
+describe('판매 계산·유효성·원가 보존',()=>{
+  it('FRD 가정 예시의 순매출·공헌이익·합계 이익률',()=>{expect(saleResult(example).profit).toBe('36725');expect(aggregate([example]).ratio).toBe('81.61');});
+  it('신규 순매출은 할인총액을 한 번만 공제',()=>{expect(makeSale(draft,original,undefined,'2026-10-12').net_sales).toBe('45000');});
+  it.each(['0','-1','1.5','abc',''])('잘못된 수량 %s 차단',(quantity)=>{expect(validateDraft({...draft,quantity},original,'2026-10-12').quantity).toBeTruthy();});
+  it.each(['-1','48001','abc'])('잘못된 할인 %s 차단',(discount_amount)=>{expect(validateDraft({...draft,discount_amount},original,'2026-10-12').discount_amount).toBeTruthy();});
+  it.each(['2026-02-30','2026-10-13','2025-06-30',''])('잘못된 날짜 %s 차단',(date)=>{expect(validateDraft({...draft,date},original,'2026-10-12').date).toBeTruthy();});
+  it('빈 수수료는 미확인, 실제 0은 정상',()=>{const missing=makeSale({...draft,payment_fee:''},original,undefined,'2026-10-12');expect(saleResult(missing).profit).toBeNull();expect(aggregate([missing,example]).profit).toBeNull();expect(saleResult({...example,payment_fee:'0'}).profit).toBe('37400');});
+  it('수수료가 매출보다 크면 음수 이익 유지',()=>{expect(saleResult({...example,payment_fee:'50000'}).profit).toBe('-12600');});
+  it('단순 수량 수정은 과거 개당원가·수수료 보존',()=>{const s=makeSale({...draft,quantity:'11'},original,example,'2026-10-12');expect(s.sale_id).toBe('example');expect(s.unit_food_cost_snapshot).toBe('600');expect(s.unit_packaging_cost_snapshot).toBe('160');expect(s.payment_fee).toBe('675');expect(s.net_sales).toBe('49800');});
+  it('채널 변경은 새 조건 원가와 포장 소모로 바뀜',()=>{const hall=makeSale({...draft,channel:'매장'},original,example,'2026-10-12');expect(hall.unit_packaging_cost_snapshot).toBe('0');expect(consumption(original,[hall]).quantities.I10).toBeUndefined();expect(consumption(original,[example]).quantities.I10).toBe('10');expect(consumption(original,[example]).quantities.I02).toBe('2000');});
+  it('가격 적용일 이전·이후를 구분하며 미래 가격은 안 씀',()=>{expect(costFor(original,'M01','2025-07-01','매장').food).toBe('460');expect(costFor(original,'M01','2026-09-01','매장').food).toBe('496.8');expect(costFor(original,'M01','2025-06-30','매장').food).toBeNull();});
+  it('원가 금액 누락과 레시피 소모량은 독립',()=>{const broken={...example,unit_food_cost_snapshot:null};expect(saleResult(broken).profit).toBeNull();expect(consumption(original,[broken]).quantities.I01).toBe('200');});
+  it('레시피 누락·단위 불일치는 원가와 소모 확인 필요',()=>{const data={...original,recipes:original.recipes.filter(r=>r.menu_id!=='M02')};expect(costFor(data,'M02',draft.date,'포장').food).toBeNull();expect(consumption(data,[example]).missing).toContain('example');});
+  it('합계 비율은 행 비율 평균이 아니며 분모 0은 계산 불가',()=>{const a={...example,quantity:1,unit_price:'100',net_sales:'100',discount_amount:'0',payment_fee:'0',unit_food_cost_snapshot:'50',unit_packaging_cost_snapshot:'0'};const b={...a,sale_id:'b',unit_price:'900',net_sales:'900',unit_food_cost_snapshot:'90'};expect(aggregate([a,b]).ratio).toBe('86.00');expect(aggregate([{...a,unit_price:'0',net_sales:'0'}]).ratio).toBeNull();});
+  it('원본 계산 불일치를 이익 합계에서 숨기지 않음',()=>{expect(saleResult({...example,net_sales:'45001'}).reasons.join()).toContain('불일치');expect(aggregate([{...example,net_sales:'45001'},example]).profit).toBeNull();});
+  it('소수는 집계 후 반올림하고 양·음 절반을 0 밖으로 반올림',()=>{expect(money('1.5')).toBe('2원');expect(money('-1.5')).toBe('-2원');expect(money(D('.4').plus('.4').toString())).toBe('1원');});
+  it('큰 합계도 일반 숫자로 변환해 끝자리를 잃지 않음',()=>{expect(money('1000000000000000000.5')).toBe('1,000,000,000,000,000,001원');});
+  it('원본 판매 전수 금액과 독립 집계 일치',()=>{const totals=aggregate(original.sales);const revenue=original.sales.reduce((t,s)=>t+Number(s.net_sales),0);const independent=original.sales.reduce((t,s)=>t+Number(s.net_sales)-s.quantity*Number(s.unit_food_cost_snapshot)-s.quantity*Number(s.unit_packaging_cost_snapshot)-Number(s.payment_fee),0);expect(totals.revenue).toBe(String(revenue));expect(Math.abs(Number(totals.profit)-independent)).toBeLessThan(.001);});
+});
+describe('초기 자료 검증',()=>{
+  it('필수 원본 표와 건수 보존',()=>{expect(original.sales).toHaveLength(6112);expect(original.menus).toHaveLength(8);expect(original.materials).toHaveLength(11);expect(original.inventory_events).toHaveLength(1515);expect(original.expenses).toHaveLength(3560);});
+  it('중복 ID·판매 조합·미연결 재료·단위 오류는 반영 차단',()=>{expect(()=>validateSeed({...raw,sales:[...raw.sales,raw.sales[0]]})).toThrow('중복');const recipes=structuredClone(raw.recipes);recipes[0].material_id='unknown';expect(()=>validateSeed({...raw,recipes})).toThrow('연결');recipes[0]= {...raw.recipes[0],unit:'ml'};expect(()=>validateSeed({...raw,recipes})).toThrow('단위');});
+  it('누락한 당시 원가를 0으로 채우지 않고 미확인으로 보존',()=>{const rows=structuredClone(raw.sales);delete rows[0].unit_food_cost_snapshot;const data=validateSeed({...raw,sales:rows});expect(data.sales[0].unit_food_cost_snapshot).toBeNull();expect(saleResult(data.sales[0]).profit).toBeNull();});
+});
+describe('실제 IndexedDB 저장·충돌·원자성',()=>{
+  let database:CafeDB;
+  beforeEach(async()=>{database=new CafeDB(`test-${crypto.randomUUID()}`);await initialize(database,async()=>raw);});
+  afterEach(async()=>{await database.delete();});
+  it('초기 자료 재반영 안 함·재열기 후 신규 기록 유지',async()=>{await initialize(database,async()=>{throw new Error('다시 읽으면 안 됨');});const s=makeSale(draft,original,undefined,'2026-10-12');await saveSale(database,s,0,false);database.close();await database.open();expect(await database.sales.count()).toBe(6113);expect((await readAll(database)).data.sales.find(r=>r.sale_id===s.sale_id)?.net_sales).toBe('45000');expect((await database.app_meta.get('app'))?.revision).toBe(1);});
+  it('수정은 동일 ID를 사용·중복 조합 추가는 덮어쓰기 안 함',async()=>{const s=makeSale(draft,original,undefined,'2026-10-12');await saveSale(database,s,0,false);await expect(saveSale(database,{...s,sale_id:'other'},1,false)).rejects.toThrow('같은 날짜');await saveSale(database,{...s,quantity:11,net_sales:'49800'},1,true);expect(await database.sales.count()).toBe(6113);expect((await database.sales.get(s.sale_id))?.quantity).toBe(11);});
+  it('오래된 입력창의 수정·삭제는 현재 기록 보존',async()=>{const s=makeSale(draft,original,undefined,'2026-10-12');await saveSale(database,s,0,false);await expect(saveSale(database,{...s,quantity:99},0,true)).rejects.toThrow('다른 창');await expect(deleteSales(database,[s.sale_id],0)).rejects.toThrow('다른 창');expect((await database.sales.get(s.sale_id))?.quantity).toBe(10);});
+  it('기록 쓰기 이후 저장 실패를 주입해 전체 롤백 검사',async()=>{const s=makeSale(draft,original,undefined,'2026-10-12');database.app_meta.hook('updating',()=>{throw new Error('QuotaExceededError: injected');});await expect(saveSale(database,s,0,false)).rejects.toThrow('QuotaExceeded');expect(await database.sales.get(s.sale_id)).toBeUndefined();expect((await database.app_meta.get('app'))?.revision).toBe(0);expect(await database.sales.count()).toBe(6112);});
+  it('여러 행 삭제 중 실패해도 모든 행 유지',async()=>{const ids=original.sales.slice(0,2).map(s=>s.sale_id);database.app_meta.hook('updating',()=>{throw new Error('storage failure');});await expect(deleteSales(database,ids,0)).rejects.toThrow();expect((await database.sales.bulkGet(ids)).filter(Boolean)).toHaveLength(2);});
+  it('유효한 여러 행 삭제 후 집계·소모에서 제외',async()=>{const ids=original.sales.slice(0,2).map(s=>s.sale_id);await deleteSales(database,ids,0);const snapshot=await readAll(database);expect(snapshot.data.sales).toHaveLength(6110);expect(snapshot.data.sales.some(s=>ids.includes(s.sale_id))).toBe(false);expect((await database.app_meta.get('app'))?.revision).toBe(1);});
+  it('필수 기준정보·원가·달력·월계획까지 저장 보존',async()=>{const s=await readAll(database);expect(s.data.sales[0]).toEqual(original.sales[0]);expect(s.data.price_history).toHaveLength(33);expect(s.data.monthly_expense_plan).toHaveLength(120);expect(s.data.calendar).toHaveLength(457);expect(s.data.opening_inventory).toHaveLength(11);});
+});

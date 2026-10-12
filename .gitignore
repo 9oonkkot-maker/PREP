@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env*
+backups/
+prep_backup_*.json
+*.log
+.test-artifacts/
+.npm-cache/
+data/*.xlsx
+data/*.xls
+docs/evidence/
